@@ -1,4 +1,5 @@
-from lightfm import LightFM
+from surprise import Dataset, Reader, SVD
+from surprise.model_selection import train_test_split
 import pymongo
 
 client = pymongo.MongoClient("")
@@ -17,21 +18,21 @@ for doc in interactions:
     )
     weighted_data.append((doc["userId"], doc["videoId"], weight))
 
-dataset = Dataset()
-dataset.fit(users=all_users, items=all_videos)
-interactions_matrix, _ = dataset.build_interactions(weighted_data)
+# Convert the data into a format suitable for surprise
+reader = Reader(rating_scale=(0, max(weight for _, _, weight in weighted_data)))
+data = Dataset.load_from_df(pd.DataFrame(weighted_data, columns=["userId", "videoId", "weight"]), reader)
 
-model = LightFM(loss="warp")
-model.fit(interactions_matrix, epochs=30)
+trainset, testset = train_test_split(data, test_size=0.25)
 
+model = SVD()
+model.fit(trainset)
 
 # Generate recommendations for a user
 def recommend_for_user(user_id, num_recommendations=5):
-    user_idx = dataset.mapping()[0][user_id]
-    all_video_ids = list(dataset.mapping()[2].values())
-    scores = model.predict(user_idx, all_video_ids)
-    top_video_indices = scores.argsort()[-num_recommendations:][::-1]
-    return [list(dataset.mapping()[2].keys())[i] for i in top_video_indices]
-
+    user_inner_id = trainset.to_inner_uid(user_id)
+    all_video_ids = trainset.all_items()
+    scores = [(trainset.to_raw_iid(video_id), model.predict(user_id, trainset.to_raw_iid(video_id)).est) for video_id in all_video_ids]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [video_id for video_id, _ in scores[:num_recommendations]]
 
 print(recommend_for_user("user1"))
