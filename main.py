@@ -10,7 +10,7 @@ import logging
 import os
 import redis
 import json
-import pickle
+import time
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -19,11 +19,11 @@ load_dotenv()
 app = FastAPI()
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),  # Output to console
-        logging.FileHandler('video_feed.log')  # Output to file
-    ]
+        logging.FileHandler("video_feed.log"),  # Output to file
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,6 @@ def get_user_interactions(user_id: str) -> dict:
         cached = None
 
     if cached:
-        logger.info(f"Cache hit for user interactions: {user_id}")
         return json.loads(cached)
 
     interactions = db.interactions.find({"userId": ObjectId(user_id)})
@@ -96,7 +95,6 @@ def get_user_interactions(user_id: str) -> dict:
     # Cache for 5 minutes
     try:
         redis_client.setex(cache_key, 300, json.dumps(result))
-        logger.info(f"Cache set for user interactions: {user_id}")
     except redis.RedisError as e:
         logger.error(f"Redis error while setting user interactions: {str(e)}")
 
@@ -157,18 +155,7 @@ def get_recommendation_score(
 
 
 def get_active_videos(user_id: str, following: List[str]) -> List[dict]:
-    """Fetch active videos with caching"""
-    cache_key = f"active_videos:{user_id}"
-    try:
-        cached = redis_client.get(cache_key)
-    except redis.RedisError as e:
-        logger.error(f"Redis error while fetching active videos: {str(e)}")
-        cached = None
-
-    if cached:
-        logger.info(f"Cache hit for active videos: {user_id}")
-        return pickle.loads(bytes.fromhex(cached))
-
+    """Fetch active videos"""
     videos = list(
         db.videos.find(
             {
@@ -179,18 +166,11 @@ def get_active_videos(user_id: str, following: List[str]) -> List[dict]:
                         "visibility": "FOLLOWERS_ONLY",
                         "userId": {"$in": [ObjectId(f) for f in following]},
                     },
-                    {"userId": ObjectId(user_id)},
                 ],
+                "userId": {"$ne": ObjectId(user_id)},
             }
         )
     )
-
-    # Cache for 10 minutes
-    try:
-        redis_client.setex(cache_key, 600, pickle.dumps(videos).hex())
-        logger.info(f"Cache set for active videos: {user_id}")
-    except redis.RedisError as e:
-        logger.error(f"Redis error while setting active videos: {str(e)}")
 
     return videos
 
@@ -204,34 +184,49 @@ async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
     - limit: Number of videos to return
     - skip: Number of videos to skip (for pagination)
     """
+    start_time = time.perf_counter()
     try:
-        # Validate user exists
+        logger.info("=== Start generating video feed ===")
+
+        # Step 1: Validate user
         user = db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        logger.info(
+            f"User validation completed in {time.perf_counter() - start_time:.4f} seconds"
+        )
 
-        # Get user interactions
+        # Step 2: Get user interactions
+        t1 = time.perf_counter()
         user_interactions = get_user_interactions(user_id)
+        logger.info(
+            f"Fetched user interactions in {time.perf_counter() - t1:.4f} seconds"
+        )
 
-        # Get all active videos
+        # Step 3: Get active videos
+        t2 = time.perf_counter()
         videos = get_active_videos(user_id, user.get("following", []))
+        logger.info(f"Fetched active videos in {time.perf_counter() - t2:.4f} seconds")
 
-        # Calculate content-based similarities
+        # Step 4: Fetch liked videos and calculate average embedding
+        t3 = time.perf_counter()
         user_liked_videos = db.interactions.find(
             {"userId": ObjectId(user_id), "likes": {"$gt": 0}}
         )
         liked_video_ids = [
             str(interaction["videoId"]) for interaction in user_liked_videos
         ]
-
-        # Get average embedding of liked videos
         liked_videos = list(
             db.videos.find({"_id": {"$in": [ObjectId(vid) for vid in liked_video_ids]}})
         )
         valid_embeddings = [v["embedding"] for v in liked_videos if v.get("embedding")]
         avg_embedding = np.mean(valid_embeddings, axis=0) if valid_embeddings else None
+        logger.info(
+            f"Calculated average embedding in {time.perf_counter() - t3:.4f} seconds"
+        )
 
-        # Calculate similarities
+        # Step 5: Content similarity calculation
+        t4 = time.perf_counter()
         content_similarities = calculate_content_similarity(
             (
                 {"_id": "", "embedding": avg_embedding}
@@ -240,37 +235,49 @@ async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
             ),
             videos,
         )
+        logger.info(
+            f"Calculated content similarities in {time.perf_counter() - t4:.4f} seconds"
+        )
 
-        # Score and rank videos
-        scored_videos = []
-        for video in videos:
-            score = get_recommendation_score(
-                video, user_interactions, content_similarities
+        # Step 6: Scoring videos
+        t5 = time.perf_counter()
+        scored_videos = [
+            (
+                video,
+                get_recommendation_score(
+                    video, user_interactions, content_similarities
+                ),
             )
-            scored_videos.append((video, score))
-
-        # Sort by score and apply pagination
+            for video in videos
+        ]
         scored_videos.sort(key=lambda x: x[1], reverse=True)
         paginated_videos = scored_videos[skip : skip + limit]
+        logger.info(
+            f"Scored and paginated videos in {time.perf_counter() - t5:.4f} seconds"
+        )
 
-        # Format response
-        response = []
-        for video, _ in paginated_videos:
-            response.append(
-                VideoResponse(
-                    id=str(video["_id"]),
-                    user_id=str(video["userId"]),
-                    title=video.get("title"),
-                    description=video.get("description"),
-                    thumbnail=video.get("thumbnail"),
-                    url=video["url"],
-                    hashtags=video.get("hashtags", []),
-                    views=video.get("views", 0),
-                    duration=video.get("duration", 0),
-                    created_at=video["createdAt"],
-                )
+        # Step 7: Formatting response
+        t6 = time.perf_counter()
+        response = [
+            VideoResponse(
+                id=str(video["_id"]),
+                user_id=str(video["userId"]),
+                title=video.get("title"),
+                description=video.get("description"),
+                thumbnail=video.get("thumbnail"),
+                url=video["url"],
+                hashtags=video.get("hashtags", []),
+                views=video.get("views", 0),
+                duration=video.get("duration", 0),
+                created_at=video["createdAt"],
             )
+            for video, _ in paginated_videos
+        ]
+        logger.info(f"Formatted response in {time.perf_counter() - t6:.4f} seconds")
 
+        logger.info(
+            f"=== Total feed generation time: {time.perf_counter() - start_time:.4f} seconds ==="
+        )
         return response
 
     except Exception as e:
