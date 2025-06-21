@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 from pymongo import MongoClient
 from bson import ObjectId
 import numpy as np
@@ -12,6 +11,8 @@ import redis
 import json
 import time
 from dotenv import load_dotenv
+
+from model import VideoResponse
 
 # Load environment variables
 load_dotenv()
@@ -50,23 +51,6 @@ try:
 except redis.RedisError as e:
     logger.error(f"Failed to connect to Redis: {str(e)}")
     raise Exception("Redis connection failed")
-
-
-class VideoResponse(BaseModel):
-    id: str
-    user_id: str
-    title: Optional[str]
-    description: Optional[str]
-    thumbnail: Optional[str]
-    url: str
-    hashtags: List[str]
-    views: int
-    duration: float
-    created_at: datetime
-
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {ObjectId: str}
 
 
 def get_user_interactions(user_id: str) -> dict:
@@ -155,24 +139,108 @@ def get_recommendation_score(
 
 
 def get_active_videos(user_id: str, following: List[str]) -> List[dict]:
-    """Fetch active videos"""
-    videos = list(
-        db.videos.find(
-            {
-                "status": "ACTIVE",
-                "$or": [
-                    {"visibility": "PUBLIC"},
+    """Fetch active videos with populated userId, targetUserId, and products"""
+    match_stage = {
+        "$match": {
+            "status": "ACTIVE",
+            "$or": [
+                {"visibility": "PUBLIC"},
+                {
+                    "visibility": "FOLLOWERS_ONLY",
+                    "userId": {"$in": [ObjectId(f) for f in following]},
+                },
+            ],
+            "userId": {"$ne": ObjectId(user_id)},
+        }
+    }
+
+    pipeline = [
+        match_stage,
+        # Project out fields that are explicitly deleted in Mongoose's toJSON/toObject
+        {
+            "$project": {"jobId": 0, "muxAssetId": 0}
+        },  # Keep embedding for similarity calc for now
+        # Lookup userId
+        {
+            "$lookup": {
+                "from": "users",
+                "localField": "userId",
+                "foreignField": "_id",
+                "as": "userId",
+                "pipeline": [
+                    {"$project": {"_id": 1, "username": 1, "image": 1}},
+                ],
+            }
+        },
+        {"$unwind": {"path": "$userId", "preserveNullAndEmptyArrays": True}},
+        # Lookup targetUserId
+        {
+            "$lookup": {
+                "from": "users",
+                "localField": "targetUserId",
+                "foreignField": "_id",
+                "as": "targetUserId",
+                "pipeline": [
+                    {"$project": {"_id": 1, "username": 1, "image": 1}},
+                ],
+            }
+        },
+        {"$unwind": {"path": "$targetUserId", "preserveNullAndEmptyArrays": True}},
+        # Lookup products with nested lookups
+        {
+            "$lookup": {
+                "from": "products",
+                "localField": "products",
+                "foreignField": "_id",
+                "as": "products",
+                "pipeline": [
                     {
-                        "visibility": "FOLLOWERS_ONLY",
-                        "userId": {"$in": [ObjectId(f) for f in following]},
+                        "$lookup": {
+                            "from": "categories",
+                            "localField": "category",
+                            "foreignField": "_id",
+                            "as": "category",
+                            "pipeline": [
+                                {"$project": {"_id": 1, "name": 1}},
+                            ],
+                        }
+                    },
+                    {
+                        "$unwind": {
+                            "path": "$category",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "users",
+                            "localField": "userId",  # This is the product owner
+                            "foreignField": "_id",
+                            "as": "userId",
+                            "pipeline": [
+                                {
+                                    "$project": {
+                                        "_id": 1,
+                                        "image": 1,
+                                        "username": 1,
+                                        "phone": 1,
+                                    }
+                                },
+                            ],
+                        }
+                    },
+                    {
+                        "$unwind": {
+                            "path": "$userId",  # Unwind the product owner
+                            "preserveNullAndEmptyArrays": True,
+                        }
                     },
                 ],
-                "userId": {"$ne": ObjectId(user_id)},
             }
-        )
-    )
+        },
+    ]
 
-    return videos
+    return list(db.videos.aggregate(pipeline))
 
 
 @app.get("/api/feed", response_model=List[VideoResponse])
@@ -256,23 +324,47 @@ async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
             f"Scored and paginated videos in {time.perf_counter() - t5:.4f} seconds"
         )
 
-        # Step 7: Formatting response
+        # Step 7: Formatting response using VideoResponse model
         t6 = time.perf_counter()
-        response = [
-            VideoResponse(
-                id=str(video["_id"]),
-                user_id=str(video["userId"]),
-                title=video.get("title"),
-                description=video.get("description"),
-                thumbnail=video.get("thumbnail"),
-                url=video["url"],
-                hashtags=video.get("hashtags", []),
-                views=video.get("views", 0),
-                duration=video.get("duration", 0),
-                created_at=video["createdAt"],
-            )
-            for video, _ in paginated_videos
-        ]
+        response = []
+        for video, _ in paginated_videos:
+            try:
+                # The MongoDB aggregation pipeline already populates these fields
+                # We just need to ensure the dict keys match Pydantic's field names/aliases
+                # and that nested objects are passed as dictionaries which Pydantic will validate.
+                video_data = {
+                    "id": str(video["_id"]),
+                    "userId": video["userId"],  # Already populated by lookup
+                    "targetUserId": video.get(
+                        "targetUserId"
+                    ),  # Already populated by lookup, can be None
+                    "url": video["url"],
+                    "filename": video["filename"],
+                    "direction": video.get("direction"),
+                    "title": video.get("title"),
+                    "description": video.get("description"),
+                    "thumbnail": video.get("thumbnail"),
+                    "hashtags": video.get("hashtags", []),
+                    "products": video.get(
+                        "products", []
+                    ),  # Already populated by lookup
+                    "visibility": video["visibility"],
+                    "views": video.get("views", 0),
+                    "manifestUrl": video.get("manifestUrl"),
+                    "status": video["status"],
+                    "duration": video.get("duration", 0),
+                    "createdAt": video["createdAt"],
+                    "updatedAt": video["updatedAt"],
+                }
+                response.append(VideoResponse(**video_data))
+            except Exception as e:
+                logger.error(
+                    f"Error validating video data with Pydantic: {str(e)} for video ID: {video.get('_id')}"
+                )
+                # Log the video data that caused the error for debugging
+                logger.debug(f"Problematic video data: {video}")
+                continue  # Skip the problematic video and continue processing others
+
         logger.info(f"Formatted response in {time.perf_counter() - t6:.4f} seconds")
 
         logger.info(
