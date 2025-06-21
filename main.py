@@ -23,7 +23,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),  # Output to console
-        logging.FileHandler("video_feed.log"),  # Output to file
     ],
 )
 logger = logging.getLogger(__name__)
