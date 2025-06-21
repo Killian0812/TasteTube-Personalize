@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from pymongo import MongoClient
@@ -8,8 +8,23 @@ from scipy.spatial.distance import cosine
 from datetime import datetime
 import logging
 import os
+import redis
+import json
+import pickle
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Output to console
+        logging.FileHandler('video_feed.log')  # Output to file
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # MongoDB connection
@@ -17,6 +32,24 @@ MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "tastetube")
 client = MongoClient(MONGODB_URI)
 db = client[DATABASE_NAME]
+
+# Redis connection
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = os.getenv("REDIS_PORT", 6379)
+REDIS_DB = os.getenv("REDIS_DB", 0)
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)  # None if no password
+try:
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=int(REDIS_PORT),
+        password=REDIS_PASSWORD,
+        decode_responses=True,
+    )
+    # Test Redis connection
+    redis_client.ping()
+except redis.RedisError as e:
+    logger.error(f"Failed to connect to Redis: {str(e)}")
+    raise Exception("Redis connection failed")
 
 
 class VideoResponse(BaseModel):
@@ -37,9 +70,20 @@ class VideoResponse(BaseModel):
 
 
 def get_user_interactions(user_id: str) -> dict:
-    """Fetch user interactions for recommendation scoring"""
+    """Fetch user interactions with caching"""
+    cache_key = f"user_interactions:{user_id}"
+    try:
+        cached = redis_client.get(cache_key)
+    except redis.RedisError as e:
+        logger.error(f"Redis error while fetching user interactions: {str(e)}")
+        cached = None
+
+    if cached:
+        logger.info(f"Cache hit for user interactions: {user_id}")
+        return json.loads(cached)
+
     interactions = db.interactions.find({"userId": ObjectId(user_id)})
-    return {
+    result = {
         str(interaction["videoId"]): {
             "likes": interaction.get("likes", 0),
             "views": interaction.get("views", 0),
@@ -48,6 +92,15 @@ def get_user_interactions(user_id: str) -> dict:
         }
         for interaction in interactions
     }
+
+    # Cache for 5 minutes
+    try:
+        redis_client.setex(cache_key, 300, json.dumps(result))
+        logger.info(f"Cache set for user interactions: {user_id}")
+    except redis.RedisError as e:
+        logger.error(f"Redis error while setting user interactions: {str(e)}")
+
+    return result
 
 
 def calculate_content_similarity(
@@ -103,6 +156,45 @@ def get_recommendation_score(
     ) * time_decay
 
 
+def get_active_videos(user_id: str, following: List[str]) -> List[dict]:
+    """Fetch active videos with caching"""
+    cache_key = f"active_videos:{user_id}"
+    try:
+        cached = redis_client.get(cache_key)
+    except redis.RedisError as e:
+        logger.error(f"Redis error while fetching active videos: {str(e)}")
+        cached = None
+
+    if cached:
+        logger.info(f"Cache hit for active videos: {user_id}")
+        return pickle.loads(bytes.fromhex(cached))
+
+    videos = list(
+        db.videos.find(
+            {
+                "status": "ACTIVE",
+                "$or": [
+                    {"visibility": "PUBLIC"},
+                    {
+                        "visibility": "FOLLOWERS_ONLY",
+                        "userId": {"$in": [ObjectId(f) for f in following]},
+                    },
+                    {"userId": ObjectId(user_id)},
+                ],
+            }
+        )
+    )
+
+    # Cache for 10 minutes
+    try:
+        redis_client.setex(cache_key, 600, pickle.dumps(videos).hex())
+        logger.info(f"Cache set for active videos: {user_id}")
+    except redis.RedisError as e:
+        logger.error(f"Redis error while setting active videos: {str(e)}")
+
+    return videos
+
+
 @app.get("/api/feed", response_model=List[VideoResponse])
 async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
     """
@@ -122,21 +214,7 @@ async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
         user_interactions = get_user_interactions(user_id)
 
         # Get all active videos
-        videos = list(
-            db.videos.find(
-                {
-                    "status": "ACTIVE",
-                    "$or": [
-                        {"visibility": "PUBLIC"},
-                        {
-                            "visibility": "FOLLOWERS_ONLY",
-                            "userId": {"$in": user.get("following", [])},
-                        },
-                        {"userId": ObjectId(user_id)},
-                    ],
-                }
-            )
-        )
+        videos = get_active_videos(user_id, user.get("following", []))
 
         # Calculate content-based similarities
         user_liked_videos = db.interactions.find(
