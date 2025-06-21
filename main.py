@@ -1,95 +1,168 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import pymongo
-from dotenv import load_dotenv
+from typing import List, Optional
+from pymongo import MongoClient
+from bson import ObjectId
+import numpy as np
+from scipy.spatial.distance import cosine
+from datetime import datetime
+import logging
 import os
-import uuid
 
-# Initialize FastAPI app
-app = FastAPI(title="Video Recommendation API")
-
-# Load environment variables
-load_dotenv()
+app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # MongoDB connection
-client = pymongo.MongoClient(os.getenv("MONGO_URI"))
-db = client["tastetube"]
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "tastetube")
+client = MongoClient(MONGODB_URI)
+db = client[DATABASE_NAME]
 
-# Pydantic model for response
-class Video(BaseModel):
-    video_id: str
-    text: str
-
-class RecommendationResponse(BaseModel):
+class VideoResponse(BaseModel):
+    id: str
     user_id: str
-    recommendations: List[Video]
+    title: Optional[str]
+    description: Optional[str]
+    thumbnail: Optional[str]
+    url: str
+    hashtags: List[str]
+    views: int
+    duration: float
+    created_at: datetime
 
-# Function to fetch video data
-def get_video_data():
-    videos = db.videos.find()
-    return [
-        {
-            "video_id": str(vid["_id"]),
-            "text": f"{vid['title']} {vid['description']} {' '.join(vid['hashtags'])}",
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {
+            ObjectId: str
         }
-        for vid in videos
-    ]
 
-# Function to compute TF-IDF and cosine similarity
-def compute_cosine_similarity(video_data):
-    tfidf = TfidfVectorizer(stop_words="english")
-    tfidf_matrix = tfidf.fit_transform([v["text"] for v in video_data])
-    return cosine_similarity(tfidf_matrix, tfidf_matrix), video_data
+def get_user_interactions(user_id: str) -> dict:
+    """Fetch user interactions for recommendation scoring"""
+    interactions = db.interactions.find({"userId": ObjectId(user_id)})
+    return {str(interaction["videoId"]): {
+        "likes": interaction.get("likes", 0),
+        "views": interaction.get("views", 0),
+        "watchTime": interaction.get("watchTime", 0),
+        "bookmarked": interaction.get("bookmarked", False)
+    } for interaction in interactions}
 
-# Recommendation function
-def recommend_videos(video_id: str, video_data: List[dict], cosine_sim: List[List[float]], num_recommendations: int = 5):
-    idx = next((i for i, video in enumerate(video_data) if video["video_id"] == video_id), None)
-    if idx is None:
+def calculate_content_similarity(video_embedding: dict, all_videos: List[dict]) -> List[dict]:
+    """Calculate cosine similarity between video embeddings"""
+    if not video_embedding:
         return []
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-    sim_scores = sim_scores[1:num_recommendations + 1]  # Exclude self
-    video_indices = [i[0] for i in sim_scores]
-    return [video_data[i] for i in video_indices]
+    
+    similarities = []
+    for video in all_videos:
+        if video.get("embedding") and str(video["_id"]) != str(video_embedding["_id"]):
+            similarity = 1 - cosine(video_embedding["embedding"], video["embedding"])
+            similarities.append({"video_id": str(video["_id"]), "score": similarity})
+    
+    return sorted(similarities, key=lambda x: x["score"], reverse=True)
 
-# API endpoint to get recommendations
-@app.get("/recommend/{user_id}", response_model=RecommendationResponse)
-async def get_recommendations(user_id: str, num_recommendations: int = 5):
+def get_recommendation_score(video: dict, user_interactions: dict, content_similarities: List[dict]) -> float:
+    """Calculate recommendation score based on multiple factors"""
+    video_id = str(video["_id"])
+    base_score = video.get("views", 0) / (video.get("views", 1) + 100)  # Normalize views
+    
+    # Content-based scoring
+    content_score = 0
+    for sim in content_similarities:
+        if sim["video_id"] == video_id:
+            content_score = sim["score"]
+            break
+    
+    # Interaction-based scoring
+    interaction_score = 0
+    if video_id in user_interactions:
+        interaction = user_interactions[video_id]
+        interaction_score = (
+            interaction["likes"] * 0.4 +
+            interaction["views"] * 0.2 +
+            interaction["watchTime"] * 0.1 +
+            (1.0 if interaction["bookmarked"] else 0.0) * 0.3
+        )
+    
+    # Time decay factor
+    time_diff = (datetime.now() - video["createdAt"]).days
+    time_decay = max(0.1, 1.0 - (time_diff / 30.0))
+    
+    # Combine scores (weights can be adjusted)
+    return (content_score * 0.5 + interaction_score * 0.3 + base_score * 0.2) * time_decay
+
+@app.get("/api/feed", response_model=List[VideoResponse])
+async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
+    """
+    Get personalized video feed for a user
+    Parameters:
+    - user_id: ID of the user
+    - limit: Number of videos to return
+    - skip: Number of videos to skip (for pagination)
+    """
     try:
-        # Fetch user data (e.g., liked or viewed videos)
-        user = db.users.find_one({"user_id": user_id})
+        # Validate user exists
+        user = db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Fetch video data
-        video_data = get_video_data()
-        if not video_data:
-            raise HTTPException(status_code=404, detail="No videos available")
+        # Get user interactions
+        user_interactions = get_user_interactions(user_id)
+        
+        # Get all active videos
+        videos = list(db.videos.find({
+            "status": "ACTIVE",
+            "$or": [
+                {"visibility": "PUBLIC"},
+                {"visibility": "FOLLOWERS_ONLY", "userId": {"$in": user.get("following", [])}},
+                {"userId": ObjectId(user_id)}
+            ]
+        }))
 
-        # Compute cosine similarity
-        cosine_sim, video_data = compute_cosine_similarity(video_data)
+        # Calculate content-based similarities
+        user_liked_videos = db.interactions.find({
+            "userId": ObjectId(user_id),
+            "likes": {"$gt": 0}
+        })
+        liked_video_ids = [str(interaction["videoId"]) for interaction in user_liked_videos]
+        
+        # Get average embedding of liked videos
+        liked_videos = list(db.videos.find({"_id": {"$in": [ObjectId(vid) for vid in liked_video_ids]}}))
+        valid_embeddings = [v["embedding"] for v in liked_videos if v.get("embedding")]
+        avg_embedding = np.mean(valid_embeddings, axis=0) if valid_embeddings else None
+        
+        # Calculate similarities
+        content_similarities = calculate_content_similarity(
+            {"_id": "", "embedding": avg_embedding} if avg_embedding is not None else {},
+            videos
+        )
 
-        # Get user's viewed or liked videos (assuming stored in user document)
-        user_videos = user.get("viewed_videos", []) or user.get("liked_videos", [])
-        if not user_videos:
-            raise HTTPException(status_code=400, detail="User has no viewed or liked videos")
+        # Score and rank videos
+        scored_videos = []
+        for video in videos:
+            score = get_recommendation_score(video, user_interactions, content_similarities)
+            scored_videos.append((video, score))
+        
+        # Sort by score and apply pagination
+        scored_videos.sort(key=lambda x: x[1], reverse=True)
+        paginated_videos = scored_videos[skip:skip + limit]
+        
+        # Format response
+        response = []
+        for video, _ in paginated_videos:
+            response.append(VideoResponse(
+                id=str(video["_id"]),
+                user_id=str(video["userId"]),
+                title=video.get("title"),
+                description=video.get("description"),
+                thumbnail=video.get("thumbnail"),
+                url=video["url"],
+                hashtags=video.get("hashtags", []),
+                views=video.get("views", 0),
+                duration=video.get("duration", 0),
+                created_at=video["createdAt"]
+            ))
 
-        # Generate recommendations based on the first viewed/liked video
-        # For simplicity, using the first video; you can extend to aggregate multiple
-        recommendations = recommend_videos(user_videos[0], video_data, cosine_sim, num_recommendations)
+        return response
 
-        return {
-            "user_id": user_id,
-            "recommendations": recommendations
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Run the app (for local testing, use: uvicorn main:app --reload)
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        logger.error(f"Error generating video feed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
