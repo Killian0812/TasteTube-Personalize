@@ -243,6 +243,11 @@ def get_active_videos(user_id: str, following: List[str]) -> List[dict]:
     return list(db.videos.aggregate(pipeline))
 
 
+@app.get("/")
+async def root():
+    return {"message": "TasteTube Personalize API is running"}
+
+
 @app.get("/api/feed", response_model=List[VideoResponse])
 async def get_video_feed(user_id: str, limit: int = 20, skip: int = 0):
     """
