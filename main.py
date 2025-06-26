@@ -134,10 +134,11 @@ def get_recommendation_score(
     if video_id in user_interactions:
         interaction = user_interactions[video_id]
         interaction_score = (
-            interaction["likes"] * 0.4
+            interaction["likes"] * 0.3
             + interaction["views"] * 0.2
             + interaction["watchTime"] * 0.1
-            + (1.0 if interaction["bookmarked"] else 0.0) * 0.3
+            + (1.0 if interaction["bookmarked"] else 0.0) * 0.2
+            + (1.0 if interaction["shared"] else 0.0) * 0.2
         )
 
     # Time decay factor
